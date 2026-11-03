@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+"""
+LogLens - Privacy-First Local JSON Log Analyzer Engine
+======================================================
+Complete pure-Python implementation of all core analytical subsystems.
+Zero third-party dependencies required.
+"""
+
+import json
+import re
+import math
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+# =============================================================================
+# 1. CORE DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class LogEntry:
+    id: str
+    timestamp_ms: int
+    level: str  # FATAL, ERROR, WARN, INFO, DEBUG, TRACE
+    service: str
+    message: str
+    trace_id: Optional[str]
+    duration_ms: Optional[float]
+    flattened: Dict[str, Any]
+    raw: Dict[str, Any]
+
+
+@dataclass
+class LogPattern:
+    id: str
+    template: str
+    sample: str
+    count: int
+    level_counts: Dict[str, int]
+    services: Set[str]
+    first_seen_ms: int
+    last_seen_ms: int
+    variable_slots: Dict[int, List[str]] = field(default_factory=dict)
+    sparkline: List[int] = field(default_factory=list)
+
+
+@dataclass
+class TraceSpan:
+    log_id: str
+    timestamp_ms: int
+    service: str
+    message: str
+    level: str
+    duration_ms: float
+    relative_offset_ms: float
+    is_error: bool
+    status_code: Optional[int] = None
+
+
+@dataclass
+class TraceWaterfall:
+    trace_id: str
+    start_ms: int
+    end_ms: int
+    total_duration_ms: float
+    services: List[str]
+    has_error: bool
+    spans: List[TraceSpan]
+
+
+@dataclass
+class AnomalyFinding:
+    type: str  # ERROR_BURST, LATENCY_OUTLIER, SILENT_GAP, FIRST_SEEN_FAILURE
+    severity: str  # CRITICAL, HIGH, MEDIUM, LOW
+    service: str
+    title: str
+    description: str
+    timestamp_start_ms: int
+    timestamp_end_ms: int
+    evidence_query: str
+    metric_value: Optional[float] = None
+    baseline_value: Optional[float] = None
+
+
+# =============================================================================
+# 2. JSON FLATTENER & FORMAT AUTO-DETECTOR
+# =============================================================================
+
+def flatten_dict(obj: Any, prefix: str = "", res: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Recursively flattens nested JSON dicts: {'a': {'b': 1}} -> {'a.b': 1}."""
+    if res is None:
+        res = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_key = f"{prefix}.{k}" if prefix else str(k)
+            flatten_dict(v, new_key, res)
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_key = f"{prefix}[{idx}]"
+            flatten_dict(item, new_key, res)
+    else:
+        res[prefix] = obj
+    return res
+
+
+def parse_timestamp_ms(val: Any) -> int:
+    """Parses ISO-8601 strings, UNIX epoch seconds, or milliseconds into epoch ms."""
+    if val is None:
+        return int(time.time() * 1000)
+    if isinstance(val, (int, float)):
+        if val < 10_000_000_000:  # Epoch seconds
+            return int(val * 1000)
+        return int(val)
+    if isinstance(val, str):
+        try:
+            return parse_timestamp_ms(float(val))
+        except ValueError:
+            pass
+        val_clean = val.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(val_clean)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    return int(time.time() * 1000)
+
+
+def normalize_level(raw_level: Any) -> str:
+    """Normalizes numeric codes (Pino/Bunyan) or various casing to standard log levels."""
+    if raw_level is None:
+        return "INFO"
+    if isinstance(raw_level, (int, float)):
+        lvl = int(raw_level)
+        if lvl >= 60: return "FATAL"
+        if lvl >= 50: return "ERROR"
+        if lvl >= 40: return "WARN"
+        if lvl >= 30: return "INFO"
+        if lvl >= 20: return "DEBUG"
+        return "TRACE"
+    
+    s = str(raw_level).upper().strip()
+    if s in ("FATAL", "CRITICAL", "PANIC", "EMERGENCY"): return "FATAL"
+    if s in ("ERROR", "ERR"): return "ERROR"
+    if s in ("WARN", "WARNING"): return "WARN"
+    if s in ("INFO", "NOTICE", "INFORMATION"): return "INFO"
+    if s in ("DEBUG", "VERBOSE"): return "DEBUG"
+    if s in ("TRACE", "SILLY"): return "TRACE"
+    return "INFO"
+
+
+class LogFormatDetector:
+    """Identifies log formats (Winston, Pino, Bunyan, ECS, GCP, AWS) and normalizes them."""
+    
+    @staticmethod
+    def detect_format(sample: Dict[str, Any]) -> str:
+        if "@timestamp" in sample and ("log.level" in sample or "ecs.version" in sample):
+            return "ECS_LOGSTASH"
+        if "severity" in sample and ("textPayload" in sample or "jsonPayload" in sample):
+            return "GCP_LOGGING"
+        if "pid" in sample and "hostname" in sample and "level" in sample and isinstance(sample.get("level"), (int, float)):
+            if "v" in sample and sample.get("v") == 0:
+                return "BUNYAN"
+            return "PINO"
+        if "timestamp" in sample and "level" in sample and ("message" in sample or "msg" in sample):
+            return "WINSTON"
+        if "@timestamp" in sample and "@message" in sample:
+            return "AWS_CLOUDWATCH"
+        return "GENERIC_JSON"
+
+    @classmethod
+    def normalize_entry(cls, raw: Dict[str, Any], index: int) -> LogEntry:
+        flattened = flatten_dict(raw)
+
+        # Timestamp
+        raw_ts = (
+            raw.get("timestamp") or raw.get("time") or raw.get("@timestamp") or
+            flattened.get("metadata.timestamp") or flattened.get("jsonPayload.timestamp")
+        )
+        ts_ms = parse_timestamp_ms(raw_ts)
+
+        # Level
+        raw_lvl = (
+            raw.get("level") or raw.get("severity") or raw.get("log.level") or
+            flattened.get("log.level") or flattened.get("metadata.level")
+        )
+        level = normalize_level(raw_lvl)
+
+        # Message
+        msg = (
+            raw.get("message") or raw.get("msg") or raw.get("textPayload") or raw.get("@message") or
+            flattened.get("jsonPayload.message") or flattened.get("error.message") or ""
+        )
+        if not msg and isinstance(raw, dict):
+            msg = json.dumps(raw)
+
+        # Service
+        svc = (
+            raw.get("service") or raw.get("name") or raw.get("service.name") or
+            flattened.get("service.name") or flattened.get("resource.labels.service_name") or
+            flattened.get("metadata.service") or "default"
+        )
+
+        # Trace ID
+        trace = (
+            raw.get("traceId") or raw.get("trace_id") or raw.get("request_id") or
+            raw.get("correlation_id") or flattened.get("trace.id") or
+            flattened.get("metadata.trace_id") or flattened.get("metadata.request_id")
+        )
+
+        # Duration / Latency
+        duration = (
+            raw.get("duration_ms") or raw.get("duration") or raw.get("latency_ms") or
+            flattened.get("duration_ms") or flattened.get("metadata.duration_ms") or
+            flattened.get("http.response.duration_ms")
+        )
+        dur_val = float(duration) if duration is not None else None
+
+        return LogEntry(
+            id=f"log-{index}",
+            timestamp_ms=ts_ms,
+            level=level,
+            service=str(svc),
+            message=str(msg),
+            trace_id=str(trace) if trace else None,
+            duration_ms=dur_val,
+            flattened=flattened,
+            raw=raw,
+        )
+
+
+# =============================================================================
+# 3. DRAIN TEMPLATE MINING ALGORITHM (LOG CLUSTERING)
+# =============================================================================
+
+class DrainNode:
+    """Tree node for Drain prefix tree clustering."""
+    def __init__(self, depth: int = 1):
+        self.depth = depth
+        self.children: Dict[str, DrainNode] = {}
+        self.clusters: List[LogPattern] = []
+
+
+class DrainTemplateMiner:
+    """
+    Fixed-depth parse tree online template miner.
+    Ref: Pinjia He et al., 'Drain: An Online Log Parsing Approach with Fixed Depth Tree'
+    """
+    def __init__(self, depth: int = 4, sim_threshold: float = 0.5):
+        self.depth = depth
+        self.sim_threshold = sim_threshold
+        self.root = DrainNode(depth=1)
+        self.clusters: List[LogPattern] = []
+
+    def _tokenize(self, content: str) -> List[str]:
+        # Pre-mask UUIDs, IPs, and hex memory addresses
+        s = re.sub(r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}", "<*>", content)
+        s = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<*>", s)
+        s = re.sub(r"\b0x[a-fA-F0-9]+\b", "<*>", s)
+        return s.strip().split()
+
+    def _calc_similarity(self, tokens1: List[str], tokens2: List[str]) -> Tuple[float, int]:
+        if len(tokens1) != len(tokens2):
+            return 0.0, 0
+        same = sum(1 for t1, t2 in zip(tokens1, tokens2) if t1 == "<*>" or t2 == "<*>" or t1 == t2)
+        return same / len(tokens1), same
+
+    def add_log_message(self, entry: LogEntry) -> str:
+        tokens = self._tokenize(entry.message)
+        seq_len = len(tokens)
+        if seq_len == 0:
+            return "empty"
+
+        # 1. Search path by message token count
+        cur_node = self.root
+        len_key = str(seq_len)
+        if len_key not in cur_node.children:
+            cur_node.children[len_key] = DrainNode(depth=2)
+        cur_node = cur_node.children[len_key]
+
+        # 2. Descend by fixed initial tokens
+        for i in range(min(self.depth - 1, seq_len)):
+            tok = tokens[i]
+            tok_key = "<*>" if any(c.isdigit() for c in tok) else tok
+            if tok_key not in cur_node.children:
+                cur_node.children[tok_key] = DrainNode(depth=cur_node.depth + 1)
+            cur_node = cur_node.children[tok_key]
+
+        # 3. Match candidate cluster
+        best_match: Optional[LogPattern] = None
+        max_sim = -1.0
+        for cluster in cur_node.clusters:
+            sim, _ = self._calc_similarity(tokens, cluster.template.split())
+            if sim > max_sim:
+                max_sim = sim
+                best_match = cluster
+
+        # 4. Update existing template with wildcard <*> or create new cluster
+        if best_match and max_sim >= self.sim_threshold:
+            c_tokens = best_match.template.split()
+            new_tokens = []
+            for idx, (t1, t2) in enumerate(zip(tokens, c_tokens)):
+                if t1 == t2:
+                    new_tokens.append(t1)
+                else:
+                    new_tokens.append("<*>")
+                    if idx not in best_match.variable_slots:
+                        best_match.variable_slots[idx] = []
+                    if len(best_match.variable_slots[idx]) < 15:
+                        best_match.variable_slots[idx].append(t1)
+
+            best_match.template = " ".join(new_tokens)
+            best_match.count += 1
+            best_match.level_counts[entry.level] = best_match.level_counts.get(entry.level, 0) + 1
+            best_match.services.add(entry.service)
+            best_match.last_seen_ms = max(best_match.last_seen_ms, entry.timestamp_ms)
+            return best_match.id
+        else:
+            pat_id = f"pat-{len(self.clusters) + 1}"
+            new_pat = LogPattern(
+                id=pat_id,
+                template=" ".join(tokens),
+                sample=entry.message,
+                count=1,
+                level_counts={entry.level: 1},
+                services={entry.service},
+                first_seen_ms=entry.timestamp_ms,
+                last_seen_ms=entry.timestamp_ms,
+            )
+            cur_node.clusters.append(new_pat)
+            self.clusters.append(new_pat)
+            return pat_id
+
+    def compute_sparklines(self, entries: List[LogEntry], buckets: int = 15):
+        """Builds temporal sparkline histogram arrays for all mined patterns."""
+        if not entries: return
+        min_t = min(e.timestamp_ms for e in entries)
+        max_t = max(e.timestamp_ms for e in entries)
+        span = max(max_t - min_t, 1)
+
+        pat_map = {p.id: p for p in self.clusters}
+        for p in self.clusters:
+            p.sparkline = [0] * buckets
+
+        for e in entries:
+            pat_id = getattr(e, "pattern_id", None)
+            if pat_id and pat_id in pat_map:
+                idx = min(int(((e.timestamp_ms - min_t) / span) * buckets), buckets - 1)
+                pat_map[pat_id].sparkline[idx] += 1
+
+
+# =============================================================================
+# 4. DISTRIBUTED TRACE WATERFALL RECONSTRUCTION
+# =============================================================================
+
+class TraceReconstructor:
+    """Correlates logs by trace/request IDs into sequenced Gantt waterfalls."""
+
+    @staticmethod
+    def build_waterfalls(entries: List[LogEntry]) -> List[TraceWaterfall]:
+        traces_map: Dict[str, List[LogEntry]] = defaultdict(list)
+        for e in entries:
+            if e.trace_id:
+                traces_map[e.trace_id].append(e)
+
+        waterfalls: List[TraceWaterfall] = []
+        for trace_id, logs in traces_map.items():
+            if len(logs) < 2:
+                continue
+            logs.sort(key=lambda x: x.timestamp_ms)
+            start_ms = logs[0].timestamp_ms
+            end_ms = logs[-1].timestamp_ms
+            total_dur = max(float(end_ms - start_ms), 1.0)
+            services = list(dict.fromkeys(l.service for l in logs))
+            has_error = any(l.level in ("ERROR", "FATAL") for l in logs)
+
+            spans: List[TraceSpan] = []
+            for l in logs:
+                dur = l.duration_ms or 15.0
+                offset = float(l.timestamp_ms - start_ms)
+                spans.append(
+                    TraceSpan(
+                        log_id=l.id,
+                        timestamp_ms=l.timestamp_ms,
+                        service=l.service,
+                        message=l.message,
+                        level=l.level,
+                        duration_ms=dur,
+                        relative_offset_ms=offset,
+                        is_error=l.level in ("ERROR", "FATAL"),
+                        status_code=l.flattened.get("metadata.status") or l.flattened.get("status"),
+                    )
+                )
+
+            waterfalls.append(
+                TraceWaterfall(
+                    trace_id=trace_id,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    total_duration_ms=total_dur,
+                    services=services,
+                    has_error=has_error,
+                    spans=spans,
+                )
+            )
+
+        waterfalls.sort(key=lambda w: (w.has_error, w.total_duration_ms), reverse=True)
+        return waterfalls
+
+
+# =============================================================================
+# 5. STATISTICAL ANOMALY & FINDINGS DETECTOR
+# =============================================================================
+
+class AnomalyDetector:
+    """Flags error spikes, latency outliers, silent deadlocks, and first-seen patterns."""
+
+    @staticmethod
+    def detect_anomalies(entries: List[LogEntry], patterns: List[LogPattern]) -> List[AnomalyFinding]:
+        findings: List[AnomalyFinding] = []
+        if len(entries) < 10:
+            return findings
+
+        entries_sorted = sorted(entries, key=lambda x: x.timestamp_ms)
+        min_t = entries_sorted[0].timestamp_ms
+        max_t = entries_sorted[-1].timestamp_ms
+
+        # 1. Error Rate Spikes per Service
+        svc_total = defaultdict(int)
+        svc_errors = defaultdict(int)
+        for e in entries_sorted:
+            svc_total[e.service] += 1
+            if e.level in ("ERROR", "FATAL"):
+                svc_errors[e.service] += 1
+
+        for svc, total in svc_total.items():
+            err_count = svc_errors[svc]
+            rate = (err_count / total) * 100
+            if rate > 15.0 and err_count >= 5:
+                findings.append(
+                    AnomalyFinding(
+                        type="ERROR_BURST",
+                        severity="CRITICAL" if rate > 40 else "HIGH",
+                        service=svc,
+                        title=f"Error Spike in service '{svc}' ({rate:.1f}%)",
+                        description=f"Service '{svc}' suffered {err_count} failures across {total} events ({rate:.1f}% failure rate).",
+                        timestamp_start_ms=min_t,
+                        timestamp_end_ms=max_t,
+                        evidence_query=f'service:"{svc}" AND level>=error',
+                        metric_value=rate,
+                    )
+                )
+
+        # 2. Latency Outliers
+        latencies = [e.duration_ms for e in entries_sorted if e.duration_ms and e.duration_ms > 0]
+        if len(latencies) >= 5:
+            latencies.sort()
+            p50 = latencies[int(len(latencies) * 0.50)]
+            p90 = latencies[int(len(latencies) * 0.90)]
+            p95 = latencies[int(len(latencies) * 0.95)]
+            threshold = max(p90 * 2.5, p95 * 1.8, p50 * 3.0)
+
+            outliers = [e for e in entries_sorted if e.duration_ms and e.duration_ms >= threshold]
+            if outliers:
+                worst = max(outliers, key=lambda x: x.duration_ms or 0)
+                findings.append(
+                    AnomalyFinding(
+                        type="LATENCY_OUTLIER",
+                        severity="HIGH",
+                        service=worst.service,
+                        title=f"Severe Latency Outlier ({worst.duration_ms:.0f}ms in {worst.service})",
+                        description=f"Detected {len(outliers)} requests exceeding threshold ({threshold:.0f}ms). Worst spike: {worst.duration_ms:.0f}ms.",
+                        timestamp_start_ms=outliers[0].timestamp_ms,
+                        timestamp_end_ms=outliers[-1].timestamp_ms,
+                        evidence_query=f'service:"{worst.service}" AND duration>{int(threshold)}',
+                        metric_value=worst.duration_ms,
+                        baseline_value=p50,
+                    )
+                )
+
+        # 3. Silent Logging Deadlock / Thread Stall
+        svc_logs: Dict[str, List[LogEntry]] = defaultdict(list)
+        for e in entries_sorted:
+            svc_logs[e.service].append(e)
+
+        for svc, s_logs in svc_logs.items():
+            if len(s_logs) < 15: continue
+            for i in range(len(s_logs) - 1):
+                gap_sec = (s_logs[i + 1].timestamp_ms - s_logs[i].timestamp_ms) / 1000.0
+                if gap_sec >= 30.0:  # Silence for >30s
+                    findings.append(
+                        AnomalyFinding(
+                            type="SILENT_GAP",
+                            severity="MEDIUM",
+                            service=svc,
+                            title=f"Silent Logging Gap in '{svc}' ({gap_sec:.0f}s)",
+                            description=f"Service '{svc}' went silent for {gap_sec:.0f} seconds, indicating potential threadpool starvation or worker deadlock.",
+                            timestamp_start_ms=s_logs[i].timestamp_ms,
+                            timestamp_end_ms=s_logs[i + 1].timestamp_ms,
+                            evidence_query=f'service:"{svc}"',
+                            metric_value=gap_sec,
+                        )
+                    )
+                    break
+
+        # 4. First-Seen Failure Patterns
+        mid_ms = min_t + int((max_t - min_t) * 0.4)
+        for pat in patterns:
+            has_error = any(pat.level_counts.get(lvl, 0) > 0 for lvl in ("ERROR", "FATAL"))
+            if has_error and pat.first_seen_ms >= mid_ms:
+                findings.append(
+                    AnomalyFinding(
+                        type="FIRST_SEEN_FAILURE",
+                        severity="CRITICAL",
+                        service=next(iter(pat.services)),
+                        title=f"New Error Template Emerged: {pat.template[:45]}...",
+                        description=f"Template '{pat.template}' with {pat.count} errors first emerged during the incident window.",
+                        timestamp_start_ms=pat.first_seen_ms,
+                        timestamp_end_ms=pat.last_seen_ms,
+                        evidence_query='level>=error',
+                        metric_value=float(pat.count),
+                    )
+                )
+
+        return findings
+
+
+# =============================================================================
+# 6. TIME-WINDOW DIFFERENTIAL ANALYZER
+# =============================================================================
+
+@dataclass
+class PatternDelta:
+    template: str
+    baseline_count: int
+    target_count: int
+    delta: int
+    percent_change: float
+    is_new: bool
+    is_disappeared: bool
+
+
+class TimeWindowDiff:
+    """Compares baseline vs target time windows to identify regressions."""
+
+    @staticmethod
+    def compare_windows(
+        entries: List[LogEntry],
+        baseline_range: Tuple[int, int],
+        target_range: Tuple[int, int],
+    ) -> Dict[str, Any]:
+        miner_b = DrainTemplateMiner()
+        miner_t = DrainTemplateMiner()
+
+        b_entries = [e for e in entries if baseline_range[0] <= e.timestamp_ms <= baseline_range[1]]
+        t_entries = [e for e in entries if target_range[0] <= e.timestamp_ms <= target_range[1]]
+
+        for e in b_entries: miner_b.add_log_message(e)
+        for e in t_entries: miner_t.add_log_message(e)
+
+        b_map = {p.template: p.count for p in miner_b.clusters}
+        t_map = {p.template: p.count for p in miner_t.clusters}
+
+        deltas: List[PatternDelta] = []
+        for tmpl in set(b_map.keys()) | set(t_map.keys()):
+            bc = b_map.get(tmpl, 0)
+            tc = t_map.get(tmpl, 0)
+            diff = tc - bc
+            pct = ((diff / bc) * 100.0) if bc > 0 else (100.0 if tc > 0 else 0.0)
+            deltas.append(
+                PatternDelta(
+                    template=tmpl,
+                    baseline_count=bc,
+                    target_count=tc,
+                    delta=diff,
+                    percent_change=pct,
+                    is_new=(bc == 0 and tc > 0),
+                    is_disappeared=(bc > 0 and tc == 0),
+                )
+            )
+
+        deltas.sort(key=lambda d: abs(d.delta), reverse=True)
+        return {
+            "baseline_count": len(b_entries),
+            "target_count": len(t_entries),
+            "new_patterns": [d for d in deltas if d.is_new],
+            "disappeared_patterns": [d for d in deltas if d.is_disappeared],
+            "frequency_deltas": deltas,
+        }
+
+
+# =============================================================================
+# 7. PII & SECRET SCANNER / REDACTOR
+# =============================================================================
+
+class PiiScanner:
+    """Detects and redacts credentials, emails, IPs, JWTs, and API tokens."""
+
+    PATTERNS = {
+        "EMAIL": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
+        "IP_ADDRESS": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+        "JWT_TOKEN": re.compile(r"eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}"),
+        "API_KEY": re.compile(r"(?:sk_live|api_key|secret|token)[a-zA-Z0-9_\-]{16,}", re.IGNORECASE),
+        "CREDIT_CARD": re.compile(r"\b(?:\d{4}[ -]?){3}\d{4}\b"),
+    }
+
+    @classmethod
+    def redact_text(cls, text: str) -> str:
+        s = cls.PATTERNS["EMAIL"].sub("[REDACTED_EMAIL]", text)
+        s = cls.PATTERNS["JWT_TOKEN"].sub("[REDACTED_JWT]", s)
+        s = cls.PATTERNS["API_KEY"].sub("[REDACTED_KEY]", s)
+        s = cls.PATTERNS["CREDIT_CARD"].sub("[REDACTED_CC]", s)
+        s = cls.PATTERNS["IP_ADDRESS"].sub("[REDACTED_IP]", s)
+        return s
+
+    @classmethod
+    def scan_entries(cls, entries: List[LogEntry]) -> Dict[str, int]:
+        findings = defaultdict(int)
+        for e in entries:
+            for p_type, regex in cls.PATTERNS.items():
+                findings[p_type] += len(regex.findall(e.message))
+        return dict(findings)
+
+
+# =============================================================================
+# 8. SEARCH & QUERY EVALUATOR
+# =============================================================================
+
+class QueryEngine:
+    """Evaluates Lucene/KQL query expressions: 'service:payments AND level>=error'."""
+
+    @staticmethod
+    def evaluate(entry: LogEntry, query: str) -> bool:
+        if not query or not query.strip():
+            return True
+
+        terms = query.strip().split()
+        idx = 0
+        while idx < len(terms):
+            term = terms[idx]
+            if term == "AND":
+                idx += 1
+                continue
+            if term == "NOT":
+                idx += 1
+                if idx < len(terms) and QueryEngine._match_term(entry, terms[idx]):
+                    return False
+                idx += 1
+                continue
+            if not QueryEngine._match_term(entry, term):
+                return False
+            idx += 1
+        return True
+
+    @staticmethod
+    def _match_term(entry: LogEntry, term: str) -> bool:
+        if ":" in term:
+            k, v = term.split(":", 1)
+            v = v.strip('"\'').lower()
+            val = str(entry.flattened.get(k) or getattr(entry, k, "")).lower()
+            return v in val
+        if term.startswith("level>="):
+            target = term.replace("level>=", "").upper()
+            weights = {"FATAL": 5, "ERROR": 4, "WARN": 3, "INFO": 2, "DEBUG": 1, "TRACE": 0}
+            return weights.get(entry.level, 2) >= weights.get(target, 2)
+        if term.startswith("/") and term.endswith("/"):
+            try:
+                return bool(re.search(term[1:-1], entry.message, re.IGNORECASE))
+            except Exception:
+                return False
+        needle = term.lower()
+        return needle in entry.message.lower() or needle in entry.service.lower()
+
+
+# =============================================================================
+# 9. INCIDENT REPORT BUILDER (MARKDOWN EXPORT)
+# =============================================================================
+
+class IncidentReportExporter:
+    """Assembles findings, patterns, and pinned logs into a clean Markdown postmortem."""
+
+    @staticmethod
+    def generate_markdown(
+        title: str,
+        severity: str,
+        findings: List[AnomalyFinding],
+        patterns: List[LogPattern],
+        pinned_entries: List[LogEntry],
+    ) -> str:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        md = [
+            f"# Incident Postmortem: {title}",
+            f"**Severity**: `{severity}` | **Generated**: {now} | **Investigator**: SRE Team",
+            "",
+            "## 1. Executive Summary",
+            "A system degradation was diagnosed locally via LogLens statistical log inspection.",
+            f"- Total Anomalies Detected: **{len(findings)}**",
+            f"- Mined Message Templates: **{len(patterns)}**",
+            "",
+            "## 2. Automated Findings",
+        ]
+        for f in findings:
+            md.append(f"### [{f.severity}] {f.title}")
+            md.append(f"- **Service**: `{f.service}`")
+            md.append(f"- **Description**: {f.description}")
+            md.append(f"- **Evidence Filter**: `{f.evidence_query}`\n")
+
+        md.append("## 3. High-Frequency Log Templates")
+        md.append("| Count | Dominant Level | Template |")
+        md.append("| :--- | :--- | :--- |")
+        for p in sorted(patterns, key=lambda x: x.count, reverse=True)[:5]:
+            top_lvl = max(p.level_counts.items(), key=lambda k: k[1])[0]
+            md.append(f"| {p.count} | `{top_lvl}` | `{p.template[:70]}` |")
+
+        if pinned_entries:
+            md.append("\n## 4. Evidence Timeline")
+            for e in pinned_entries:
+                ts = datetime.fromtimestamp(e.timestamp_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                md.append(f"- **{ts}** `[{e.level}]` **[{e.service}]**: {PiiScanner.redact_text(e.message)}")
+
+        md.append("\n## 5. Corrective Action Items")
+        md.append("- [ ] Investigate upstream gateway retry limits to halt cascading retry storms.")
+        md.append("- [ ] Increase primary database connection pool limits.")
+        md.append("- [ ] Add circuit-breaking between auth and payment microservices.")
+        return "\n".join(md)
+
+
+# =============================================================================
+# 10. CLI DEMONSTRATION & TEST RUNNER
+# =============================================================================
+
+def generate_sample_incident_ndjson() -> str:
+    """Generates realistic multi-service logs with an injected DB connection pool failure."""
+    lines = []
+    base_time = int(time.time() * 1000) - (20 * 60 * 1000)
+
+    # 1. Baseline healthy traffic
+    for i in range(120):
+        t = base_time + (i * 5000)
+        req_id = f"req-{1000 + i}"
+        lines.append(json.dumps({
+            "timestamp": t,
+            "level": "info",
+            "service": "gateway",
+            "message": "HTTP GET /api/v1/catalog returned 200 OK in 45ms for client 192.168.1.5",
+            "metadata": {"request_id": req_id, "status": 200, "duration_ms": 45}
+        }))
+        lines.append(json.dumps({
+            "timestamp": t + 20,
+            "level": "info",
+            "service": "auth-api",
+            "message": f"Token validated successfully for user_{i}@corp.internal",
+            "metadata": {"request_id": req_id, "api_key": "sk_live_sec9988776655443322"}
+        }))
+
+    # 2. Injected Database Exhaustion & Retry Storm
+    incident_start = base_time + (10 * 60 * 1000)
+    for i in range(80):
+        t = incident_start + (i * 3500)
+        txn_id = f"txn_{i:04x}"
+        lines.append(json.dumps({
+            "timestamp": t,
+            "level": "error",
+            "service": "payments",
+            "message": f"Connection timeout to db-primary:5432 after 5000ms for txn_id: {txn_id} (retry {i % 3 + 1} of 3)",
+            "metadata": {"request_id": f"req-err-{i}", "status": 504, "duration_ms": 5012}
+        }))
+        lines.append(json.dumps({
+            "timestamp": t + 50,
+            "level": "error",
+            "service": "gateway",
+            "message": "Upstream gateway error 504 Gateway Timeout while proxying request to /api/v1/charge",
+            "metadata": {"request_id": f"req-err-{i}", "status": 504, "duration_ms": 5050}
+        }))
+
+    # 3. Fatal Crash
+    for i in range(15):
+        lines.append(json.dumps({
+            "timestamp": incident_start + 180000 + (i * 2000),
+            "level": "fatal",
+            "service": "payments",
+            "message": "PoolExhaustedError: Maximum connection pool size 50 reached on db-primary:5432",
+            "metadata": {"status": 503}
+        }))
+
+    return "\n".join(lines)
+
+
+def run_demo():
+    print("=" * 80)
+    print("  LOGLENS - LOCAL JSON LOG ANALYZER ENGINE (PYTHON PORT)")
+    print("=" * 80)
+
+    # 1. Ingestion
+    print("\n[1/7] Ingesting & Detecting Format...")
+    raw_ndjson = generate_sample_incident_ndjson()
+    raw_lines = [json.loads(line) for line in raw_ndjson.strip().split("\n") if line]
+    entries = [LogFormatDetector.normalize_entry(raw, idx) for idx, raw in enumerate(raw_lines)]
+    print(f"  -> Ingested {len(entries)} lines.")
+    print(f"  -> Detected Shape: {LogFormatDetector.detect_format(raw_lines[0])}")
+
+    # 2. Drain Clustering
+    print("\n[2/7] Mining Templates via Drain Clustering...")
+    miner = DrainTemplateMiner(depth=4, sim_threshold=0.5)
+    for e in entries:
+        setattr(e, "pattern_id", miner.add_log_message(e))
+    miner.compute_sparklines(entries)
+    print(f"  -> Collapsed {len(entries)} raw lines into {len(miner.clusters)} pattern templates:")
+    for pat in sorted(miner.clusters, key=lambda p: p.count, reverse=True):
+        lvl_str = ", ".join(f"{k}:{v}" for k, v in pat.level_counts.items())
+        print(f"     [{pat.count:3d}x] ({lvl_str}) {pat.template}")
+
+    # 3. Trace Reconstruction
+    print("\n[3/7] Reconstructing Distributed Traces...")
+    waterfalls = TraceReconstructor.build_waterfalls(entries)
+    print(f"  -> Reconstructed {len(waterfalls)} traces.")
+    if waterfalls:
+        top_err = waterfalls[0]
+        print(f"  -> Failing Trace: {top_err.trace_id} ({top_err.total_duration_ms:.0f}ms)")
+        for s in top_err.spans:
+            print(f"     +{s.relative_offset_ms:4.0f}ms [{s.level}] [{s.service}] {s.message[:65]}")
+
+    # 4. Anomaly Findings
+    print("\n[4/7] Running Statistical Anomaly Detection...")
+    findings = AnomalyDetector.detect_anomalies(entries, miner.clusters)
+    for f in findings:
+        print(f"  * [{f.severity}] {f.title}")
+        print(f"    Evidence Query: {f.evidence_query}")
+
+    # 5. Time-Window Diff
+    print("\n[5/7] Time-Window Differential Analysis...")
+    t_min = min(e.timestamp_ms for e in entries)
+    t_max = max(e.timestamp_ms for e in entries)
+    t_mid = t_min + (t_max - t_min) // 2
+    diff = TimeWindowDiff.compare_windows(entries, (t_min, t_mid), (t_mid, t_max))
+    print(f"  -> Newly Emerged Templates in Incident: {len(diff['new_patterns'])}")
+    for np in diff['new_patterns']:
+        print(f"     + NEW [{np.target_count}x]: {np.template}")
+
+    # 6. PII Masking
+    print("\n[6/7] PII & Secret Redaction...")
+    print(f"  -> Detected: {PiiScanner.scan_entries(entries)}")
+    sample_raw = entries[1].message
+    print(f"  -> Before: {sample_raw}")
+    print(f"  -> After:  {PiiScanner.redact_text(sample_raw)}")
+
+    # 7. Incident Markdown
+    print("\n[7/7] Markdown Incident Report Generation...")
+    md = IncidentReportExporter.generate_markdown(
+        title="Primary DB Pool Exhaustion",
+        severity="SEV-1",
+        findings=findings,
+        patterns=miner.clusters,
+        pinned_entries=[e for e in entries if e.level in ("ERROR", "FATAL")][:2],
+    )
+    print("\n" + "=" * 35 + " [PREVIEW] " + "=" * 35)
+    print(md[:600] + "\n...")
+    print("=" * 80)
+    print("SUCCESS: Full LogLens pipeline executed cleanly in Python!\n")
+
+
+if __name__ == "__main__":
+    run_demo()
